@@ -33,6 +33,8 @@ typedef struct {
     int max_inflight;
     int transport_failures;
     int server_failures;
+    int transport_threshold;
+    int server_threshold;
     int base_ms;
     int max_ms;
     int open_ms;
@@ -44,10 +46,14 @@ struct worker {
     db_pool *db;
     const char *payment_url;
     const char *inventory_url;
+    const char *events_url;
     WorkerConfig cfg;
     breaker br;
+    breaker bus_br;
     pthread_t *tids;
     int nthreads;
+    pthread_t *event_tids;
+    int nevent_threads;
     volatile int stop;
 };
 
@@ -72,15 +78,18 @@ static void sleep_ms(int ms)
 
 /* breaker ------------------------------------------------------------------ */
 
-static void breaker_init(breaker *b, const WorkerConfig *cfg)
+static void breaker_init(breaker *b, int max_inflight, int base_ms, int max_ms,
+                         int transport_thr, int server_thr)
 {
     memset(b, 0, sizeof(*b));
     pthread_mutex_init(&b->mu, NULL);
     b->state = BR_CLOSED;
-    b->max_inflight = cfg->payment_max_inflight > 0 ? cfg->payment_max_inflight : 1;
-    b->base_ms = cfg->breaker_base_ms > 0 ? cfg->breaker_base_ms : 500;
-    b->max_ms = cfg->breaker_max_ms >= b->base_ms ? cfg->breaker_max_ms : b->base_ms;
+    b->max_inflight = max_inflight > 0 ? max_inflight : 1;
+    b->base_ms = base_ms > 0 ? base_ms : 500;
+    b->max_ms = max_ms >= b->base_ms ? max_ms : b->base_ms;
     b->open_ms = b->base_ms;
+    b->transport_threshold = transport_thr > 0 ? transport_thr : 2;
+    b->server_threshold = server_thr > 0 ? server_thr : 20;
 }
 
 static int breaker_cooldown_ms(breaker *b)
@@ -160,7 +169,7 @@ static void breaker_end(breaker *b, int is_probe, int fail_kind)
         } else if (fail_kind == FAIL_TRANSPORT) {
             b->transport_failures++;
             b->server_failures = 0;
-            if (b->transport_failures >= 2) {
+            if (b->transport_failures >= b->transport_threshold) {
                 b->state = BR_OPEN;
                 b->open_until = now_ms() + b->open_ms;
                 if (b->open_ms < b->max_ms) {
@@ -175,7 +184,7 @@ static void breaker_end(breaker *b, int is_probe, int fail_kind)
             b->transport_failures = 0;
             /* Отдельные 5xx — обычные ретраи; цепь рвём только на потоке
              * ошибок, чтобы не заваливать действительно упавший сервис. */
-            if (b->server_failures >= 20) {
+            if (b->server_failures >= b->server_threshold) {
                 b->state = BR_OPEN;
                 b->open_until = now_ms() + b->open_ms;
                 if (b->open_ms < b->max_ms) {
@@ -404,6 +413,85 @@ static void process_order(worker *w, Order *o)
     }
 }
 
+/* outgoing events ---------------------------------------------------------- */
+
+static void publish_event(worker *w, Event *e)
+{
+    int is_probe = 0;
+    if (!breaker_try_begin(&w->bus_br, &is_probe)) {
+        (void)db_event_retry_later(w->db, e->id,
+                                   200 + (int)(now_ms() % 200), "bus_gate");
+        return;
+    }
+
+    char url[2048];
+    snprintf(url, sizeof(url), "%s/events", w->events_url);
+
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"id\":\"%s\",\"type\":\"order.paid\",\"order_id\":\"%s\","
+             "\"occurred_at\":\"%s\"}",
+             e->id, e->id, e->occurred_at);
+
+    HttpResp r;
+    CURLcode rc = http_request("POST", url, body, NULL,
+                               w->cfg.event_timeout_ms, &r);
+
+    int fail_kind = FAIL_OK;
+    int ok = 0;
+    char err[256] = "";
+    if (rc == CURLE_OK) {
+        if (r.status == 202) {
+            ok = 1;
+        } else {
+            fail_kind = FAIL_SERVER;
+            snprintf(err, sizeof(err), "bus_status_%ld", r.status);
+        }
+    } else {
+        fail_kind = FAIL_TRANSPORT;
+        snprintf(err, sizeof(err), "bus_curl_%d", (int)rc);
+    }
+    http_resp_free(&r);
+    breaker_end(&w->bus_br, is_probe, fail_kind);
+
+    if (ok) {
+        if (db_mark_event_published(w->db, e->id) != 0) {
+            (void)db_event_retry_later(w->db, e->id, 200,
+                                       "db_mark_event_failed");
+        }
+        return;
+    }
+
+    log_warn("event %s: %s", e->id, err);
+    (void)db_event_retry_later(w->db, e->id, retry_delay_ms(w, e->attempts),
+                               err);
+}
+
+static void *event_worker_main(void *arg)
+{
+    worker *w = arg;
+    while (!w->stop) {
+        int cd = breaker_cooldown_ms(&w->bus_br);
+        if (cd > 0) {
+            sleep_ms(cd > 200 ? 200 : cd);
+            continue;
+        }
+        Event e;
+        memset(&e, 0, sizeof(e));
+        int r = db_claim_event(w->db, &e);
+        if (r < 0) {
+            sleep_ms(200);
+            continue;
+        }
+        if (r == 0) {
+            sleep_ms(100);
+            continue;
+        }
+        publish_event(w, &e);
+    }
+    return NULL;
+}
+
 static void *worker_main(void *arg)
 {
     worker *w = arg;
@@ -431,7 +519,8 @@ static void *worker_main(void *arg)
 }
 
 worker *worker_start(db_pool *db, const char *payment_url,
-                     const char *inventory_url, const WorkerConfig *cfg)
+                     const char *inventory_url, const char *events_url,
+                     const WorkerConfig *cfg)
 {
     worker *w = calloc(1, sizeof(*w));
     if (w == NULL) {
@@ -440,16 +529,26 @@ worker *worker_start(db_pool *db, const char *payment_url,
     w->db = db;
     w->payment_url = payment_url;
     w->inventory_url = inventory_url;
+    w->events_url = events_url;
     w->cfg = *cfg;
-    breaker_init(&w->br, cfg);
+    breaker_init(&w->br, cfg->payment_max_inflight, cfg->breaker_base_ms,
+                 cfg->breaker_max_ms, 2, 20);
+    breaker_init(&w->bus_br, cfg->bus_max_inflight,
+                 cfg->bus_breaker_base_ms, cfg->bus_breaker_max_ms, 2, 2);
 
     int n = cfg->worker_threads > 0 ? cfg->worker_threads : 8;
+    int ne = cfg->event_threads > 0 ? cfg->event_threads : 2;
     w->tids = calloc((size_t)n, sizeof(*w->tids));
-    if (w->tids == NULL) {
+    w->event_tids = calloc((size_t)ne, sizeof(*w->event_tids));
+    if (w->tids == NULL || w->event_tids == NULL) {
         pthread_mutex_destroy(&w->br.mu);
+        pthread_mutex_destroy(&w->bus_br.mu);
+        free(w->tids);
+        free(w->event_tids);
         free(w);
         return NULL;
     }
+
     for (int i = 0; i < n; i++) {
         if (pthread_create(&w->tids[i], NULL, worker_main, w) != 0) {
             log_error("не удалось создать worker %d", i);
@@ -459,11 +558,38 @@ worker *worker_start(db_pool *db, const char *payment_url,
     }
     if (w->nthreads == 0) {
         pthread_mutex_destroy(&w->br.mu);
+        pthread_mutex_destroy(&w->bus_br.mu);
         free(w->tids);
+        free(w->event_tids);
         free(w);
         return NULL;
     }
-    log_info("orders: запущено %d воркеров", w->nthreads);
+
+    if (events_url != NULL && *events_url != '\0') {
+        for (int i = 0; i < ne; i++) {
+            if (pthread_create(&w->event_tids[i], NULL, event_worker_main,
+                               w) != 0) {
+                log_error("не удалось создать event worker %d", i);
+                break;
+            }
+            w->nevent_threads++;
+        }
+        if (w->nevent_threads == 0) {
+            w->stop = 1;
+            for (int i = 0; i < w->nthreads; i++) {
+                pthread_join(w->tids[i], NULL);
+            }
+            pthread_mutex_destroy(&w->br.mu);
+            pthread_mutex_destroy(&w->bus_br.mu);
+            free(w->tids);
+            free(w->event_tids);
+            free(w);
+            return NULL;
+        }
+    }
+
+    log_info("orders: запущено %d воркеров, %d event-воркеров",
+             w->nthreads, w->nevent_threads);
     return w;
 }
 
@@ -476,7 +602,12 @@ void worker_stop(worker *w)
     for (int i = 0; i < w->nthreads; i++) {
         pthread_join(w->tids[i], NULL);
     }
+    for (int i = 0; i < w->nevent_threads; i++) {
+        pthread_join(w->event_tids[i], NULL);
+    }
     pthread_mutex_destroy(&w->br.mu);
+    pthread_mutex_destroy(&w->bus_br.mu);
     free(w->tids);
+    free(w->event_tids);
     free(w);
 }

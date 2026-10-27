@@ -28,6 +28,12 @@ typedef struct {
 } Order;
 
 typedef struct {
+    char id[64];
+    char occurred_at[64];
+    int attempts;
+} Event;
+
+typedef struct {
     int worker_threads;
     int payment_max_inflight;
     int payment_timeout_ms;
@@ -37,6 +43,11 @@ typedef struct {
     int backoff_base_ms;
     int backoff_max_ms;
     int lease_seconds;
+    int event_threads;
+    int event_timeout_ms;
+    int bus_max_inflight;
+    int bus_breaker_base_ms;
+    int bus_breaker_max_ms;
 } WorkerConfig;
 
 /* logging ------------------------------------------------------------------ */
@@ -81,6 +92,16 @@ int db_claim_order(db_pool *p, Order *out);
 int db_set_terminal(db_pool *p, const char *id, const char *status);
 int db_retry_later(db_pool *p, const char *id, int delay_ms, const char *err);
 
+/* 1 — событие захвачено, 0 — нет готовых, -1 — ошибка */
+int db_claim_event(db_pool *p, Event *out);
+int db_mark_event_published(db_pool *p, const char *id);
+int db_event_retry_later(db_pool *p, const char *id, int delay_ms,
+                         const char *err);
+
+int db_process_delivery(db_pool *p, const char *event_id, const char *user_id,
+                        int64_t bonus_points);
+int db_get_bonus(db_pool *p, const char *user_id, int64_t *points);
+
 void order_free(Order *o);
 
 /* http client -------------------------------------------------------------- */
@@ -101,7 +122,8 @@ CURLcode http_request(const char *method, const char *url, const char *body,
 typedef struct worker worker;
 
 worker *worker_start(db_pool *db, const char *payment_url,
-                     const char *inventory_url, const WorkerConfig *cfg);
+                     const char *inventory_url, const char *events_url,
+                     const WorkerConfig *cfg);
 void worker_stop(worker *w);
 
 #endif

@@ -254,6 +254,87 @@ static enum MHD_Result handle_get_order(app_ctx *app,
     return reply_json(conn, MHD_HTTP_OK, resp_json);
 }
 
+/* POST /webhooks/delivery -------------------------------------------------- */
+
+static enum MHD_Result handle_delivery_webhook(app_ctx *app,
+                                               struct MHD_Connection *conn,
+                                               const char *body, size_t len)
+{
+    cJSON *root = cJSON_ParseWithLength(body, len);
+    if (root == NULL) {
+        return reply_error(conn, MHD_HTTP_BAD_REQUEST, "bad_request");
+    }
+
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *user = cJSON_GetObjectItemCaseSensitive(root, "user_id");
+    cJSON *points = cJSON_GetObjectItemCaseSensitive(root, "bonus_points");
+
+    int valid = cJSON_IsString(id) && id->valuestring != NULL &&
+                id->valuestring[0] != '\0' &&
+                strlen(id->valuestring) < 256 &&
+                cJSON_IsString(type) && type->valuestring != NULL &&
+                strcmp(type->valuestring, "delivery.confirmed") == 0 &&
+                cJSON_IsString(user) && user->valuestring != NULL &&
+                user->valuestring[0] != '\0' &&
+                strlen(user->valuestring) < 256 &&
+                cJSON_IsNumber(points);
+    if (!valid) {
+        cJSON_Delete(root);
+        return reply_error(conn, MHD_HTTP_BAD_REQUEST, "bad_request");
+    }
+
+    double pd = points->valuedouble;
+    if (pd < 1.0 || pd > 9.0e15 || pd != (double)(int64_t)pd) {
+        cJSON_Delete(root);
+        return reply_error(conn, MHD_HTTP_BAD_REQUEST, "bad_request");
+    }
+
+    int rc = db_process_delivery(app->db, id->valuestring, user->valuestring,
+                                 (int64_t)pd);
+    cJSON_Delete(root);
+    if (rc != 0) {
+        return reply_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "internal");
+    }
+    return reply_json(conn, MHD_HTTP_OK, "{\"status\":\"accepted\"}");
+}
+
+/* GET /users/{id}/bonus ---------------------------------------------------- */
+
+static enum MHD_Result handle_get_bonus(app_ctx *app,
+                                        struct MHD_Connection *conn,
+                                        const char *url)
+{
+    static const char *prefix = "/users/";
+    static const char *suffix = "/bonus";
+    const char *rest = url + strlen(prefix);
+    size_t rest_len = strcspn(rest, "?");
+    size_t suffix_len = strlen(suffix);
+
+    if (rest_len <= suffix_len ||
+        strcmp(rest + rest_len - suffix_len, suffix) != 0) {
+        return reply_error(conn, MHD_HTTP_NOT_FOUND, "not_found");
+    }
+    size_t id_len = rest_len - suffix_len;
+    if (id_len == 0 || id_len >= 64 || memchr(rest, '/', id_len) != NULL) {
+        return reply_error(conn, MHD_HTTP_NOT_FOUND, "not_found");
+    }
+
+    char user_id[64];
+    memcpy(user_id, rest, id_len);
+    user_id[id_len] = '\0';
+
+    int64_t points = 0;
+    if (db_get_bonus(app->db, user_id, &points) != 0) {
+        return reply_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "internal");
+    }
+
+    char resp_json[128];
+    snprintf(resp_json, sizeof(resp_json), "{\"points\":%lld}",
+             (long long)points);
+    return reply_json(conn, MHD_HTTP_OK, resp_json);
+}
+
 /* MHD callbacks ------------------------------------------------------------ */
 
 static void request_completed(void *cls, struct MHD_Connection *conn,
@@ -271,6 +352,12 @@ static void request_completed(void *cls, struct MHD_Connection *conn,
     }
 }
 
+static int is_post_body_route(const char *url)
+{
+    return strcmp(url, "/orders") == 0 ||
+           strcmp(url, "/webhooks/delivery") == 0;
+}
+
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                       const char *url, const char *method,
                                       const char *version,
@@ -280,7 +367,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
     (void)version;
     app_ctx *app = cls;
 
-    if (strcmp(method, "POST") == 0 && strcmp(url, "/orders") == 0) {
+    if (strcmp(method, "POST") == 0 && is_post_body_route(url)) {
         ReqBody *rb = *con_cls;
         if (rb == NULL) {
             rb = calloc(1, sizeof(*rb));
@@ -324,10 +411,14 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         enum MHD_Result ret;
         if (rb->too_large) {
             ret = reply_error(conn, MHD_HTTP_BAD_REQUEST, "bad_request");
-        } else {
+        } else if (strcmp(url, "/orders") == 0) {
             ret = handle_create_order(app, conn,
                                       rb->data != NULL ? rb->data : "",
                                       rb->len);
+        } else {
+            ret = handle_delivery_webhook(app, conn,
+                                          rb->data != NULL ? rb->data : "",
+                                          rb->len);
         }
         free(rb->data);
         free(rb);
@@ -341,6 +432,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
     if (strcmp(method, "GET") == 0 && strncmp(url, "/orders/", 8) == 0) {
         return handle_get_order(app, conn, url);
+    }
+
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/users/", 7) == 0) {
+        return handle_get_bonus(app, conn, url);
     }
 
     return reply_error(conn, MHD_HTTP_NOT_FOUND, "not_found");
@@ -361,6 +456,7 @@ int main(void)
     const char *database_url = must_env("DATABASE_URL");
     char *payment_url = url_env("PAYMENT_URL");
     char *inventory_url = url_env("INVENTORY_URL");
+    char *events_url = url_env("EVENTS_URL");
     int port = int_env("PORT", 8080);
 
     WorkerConfig cfg;
@@ -373,6 +469,11 @@ int main(void)
     cfg.backoff_base_ms = int_env("BACKOFF_BASE_MS", 200);
     cfg.backoff_max_ms = int_env("BACKOFF_MAX_MS", 4000);
     cfg.lease_seconds = int_env("LEASE_SECONDS", 60);
+    cfg.event_threads = int_env("EVENT_THREADS", 2);
+    cfg.event_timeout_ms = int_env("EVENT_TIMEOUT_MS", 5000);
+    cfg.bus_max_inflight = int_env("BUS_MAX_INFLIGHT", 2);
+    cfg.bus_breaker_base_ms = int_env("BUS_BREAKER_BASE_MS", 500);
+    cfg.bus_breaker_max_ms = int_env("BUS_BREAKER_MAX_MS", 4000);
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
         log_error("curl_global_init");
@@ -397,10 +498,14 @@ int main(void)
     }
     db_reset_leases(db);
 
-    worker *wrk = worker_start(db, payment_url, inventory_url, &cfg);
+    worker *wrk = worker_start(db, payment_url, inventory_url, events_url,
+                               &cfg);
     if (wrk == NULL) {
         log_error("не удалось запустить воркеры");
         db_pool_destroy(db);
+        free(payment_url);
+        free(inventory_url);
+        free(events_url);
         return 1;
     }
 
@@ -416,6 +521,10 @@ int main(void)
         log_error("не удалось запустить HTTP-сервер на порту %d", port);
         worker_stop(wrk);
         db_pool_destroy(db);
+        free(payment_url);
+        free(inventory_url);
+        free(events_url);
+        curl_global_cleanup();
         return 1;
     }
     log_info("orders: слушаю :%d", port);
@@ -430,6 +539,7 @@ int main(void)
     db_pool_destroy(db);
     free(payment_url);
     free(inventory_url);
+    free(events_url);
     curl_global_cleanup();
     return 0;
 }

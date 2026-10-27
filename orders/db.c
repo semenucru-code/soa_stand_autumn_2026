@@ -149,11 +149,40 @@ int db_init_schema(db_pool *p)
         "  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
         "  lease_until TIMESTAMPTZ,"
         "  last_error TEXT,"
+        "  paid_at TIMESTAMPTZ,"
+        "  event_published_at TIMESTAMPTZ,"
+        "  event_attempts INT NOT NULL DEFAULT 0,"
+        "  event_next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+        "  event_lease_until TIMESTAMPTZ,"
+        "  event_last_error TEXT,"
         "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
         "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
         ");"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS"
+        "  event_published_at TIMESTAMPTZ;"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS"
+        "  event_attempts INT NOT NULL DEFAULT 0;"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS"
+        "  event_next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS"
+        "  event_lease_until TIMESTAMPTZ;"
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS event_last_error TEXT;"
         "CREATE INDEX IF NOT EXISTS orders_pending_idx"
-        "  ON orders (status, next_attempt_at) WHERE status = 'pending';";
+        "  ON orders (status, next_attempt_at) WHERE status = 'pending';"
+        "CREATE INDEX IF NOT EXISTS orders_event_idx"
+        "  ON orders (event_next_attempt_at)"
+        "  WHERE status = 'paid' AND event_published_at IS NULL;"
+        "CREATE TABLE IF NOT EXISTS delivery_events ("
+        "  id TEXT PRIMARY KEY,"
+        "  user_id TEXT NOT NULL,"
+        "  bonus_points BIGINT NOT NULL,"
+        "  processed_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ");"
+        "CREATE TABLE IF NOT EXISTS user_bonus ("
+        "  user_id TEXT PRIMARY KEY,"
+        "  points BIGINT NOT NULL DEFAULT 0"
+        ");";
 
     PGconn *c = pool_get(p);
     PGresult *r = PQexec(c, sql);
@@ -171,7 +200,10 @@ void db_reset_leases(db_pool *p)
     PGconn *c = pool_get(p);
     PGresult *r = PQexec(c,
         "UPDATE orders SET lease_until = NULL, updated_at = now()"
-        " WHERE status = 'pending' AND lease_until IS NOT NULL");
+        " WHERE status = 'pending' AND lease_until IS NOT NULL;"
+        "UPDATE orders SET event_lease_until = NULL, updated_at = now()"
+        " WHERE status = 'paid' AND event_published_at IS NULL"
+        "   AND event_lease_until IS NOT NULL");
     if (!result_ok(r)) {
         log_warn("postgres: reset leases: %s", PQerrorMessage(c));
     }
@@ -327,7 +359,11 @@ int db_set_terminal(db_pool *p, const char *id, const char *status)
     const char *vals[2] = {id, status};
     PGresult *r = exec_params(p,
         "UPDATE orders"
-        "   SET status = $2, lease_until = NULL, last_error = NULL,"
+        "   SET status = $2,"
+        "       paid_at = CASE"
+        "         WHEN $2 = 'paid' AND paid_at IS NULL THEN now()"
+        "         ELSE paid_at END,"
+        "       lease_until = NULL, last_error = NULL,"
         "       updated_at = now()"
         " WHERE id = $1", 2, vals);
     int ok = result_ok(r);
@@ -361,6 +397,143 @@ int db_retry_later(db_pool *p, const char *id, int delay_ms, const char *err)
     }
     PQclear(r);
     return ok ? 0 : -1;
+}
+
+int db_claim_event(db_pool *p, Event *out)
+{
+    static const char *sql =
+        "WITH due AS ("
+        "  SELECT id FROM orders"
+        "   WHERE status = 'paid'"
+        "     AND event_published_at IS NULL"
+        "     AND event_next_attempt_at <= now()"
+        "     AND (event_lease_until IS NULL OR event_lease_until < now())"
+        "   ORDER BY event_next_attempt_at, created_at"
+        "   LIMIT 1"
+        "   FOR UPDATE SKIP LOCKED"
+        ")"
+        "UPDATE orders o"
+        "   SET event_lease_until = now() + interval '60 seconds',"
+        "       updated_at = now()"
+        "  FROM due"
+        " WHERE o.id = due.id"
+        " RETURNING o.id, o.event_attempts::text,"
+        "   to_char(COALESCE(o.paid_at, now()) AT TIME ZONE 'UTC',"
+        "           'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')";
+
+    PGresult *r = exec_params(p, sql, 0, NULL);
+    if (!result_ok(r)) {
+        if (r != NULL) {
+            log_error("postgres: claim event: %s", PQresultErrorMessage(r));
+        }
+        PQclear(r);
+        return -1;
+    }
+    if (PQntuples(r) == 0) {
+        PQclear(r);
+        return 0;
+    }
+
+    memset(out, 0, sizeof(*out));
+    copy_str(out->id, sizeof(out->id), PQgetvalue(r, 0, 0));
+    out->attempts = atoi(PQgetvalue(r, 0, 1));
+    copy_str(out->occurred_at, sizeof(out->occurred_at),
+             PQgetvalue(r, 0, 2));
+    PQclear(r);
+    return 1;
+}
+
+int db_mark_event_published(db_pool *p, const char *id)
+{
+    const char *vals[1] = {id};
+    PGresult *r = exec_params(p,
+        "UPDATE orders"
+        "   SET event_published_at = now(),"
+        "       event_lease_until = NULL,"
+        "       event_last_error = NULL,"
+        "       updated_at = now()"
+        " WHERE id = $1", 1, vals);
+    int ok = result_ok(r);
+    if (!ok && r != NULL) {
+        log_error("postgres: mark event %s: %s", id, PQresultErrorMessage(r));
+    }
+    PQclear(r);
+    return ok ? 0 : -1;
+}
+
+int db_event_retry_later(db_pool *p, const char *id, int delay_ms,
+                         const char *err)
+{
+    if (delay_ms < 0) {
+        delay_ms = 0;
+    }
+    char delay[32];
+    snprintf(delay, sizeof(delay), "%d", delay_ms);
+    const char *vals[3] = {id, err ? err : "", delay};
+    PGresult *r = exec_params(p,
+        "UPDATE orders"
+        "   SET event_attempts = event_attempts + 1,"
+        "       event_last_error = $2,"
+        "       event_next_attempt_at ="
+        "         now() + ($3 || ' milliseconds')::interval,"
+        "       event_lease_until = NULL,"
+        "       updated_at = now()"
+        " WHERE id = $1", 3, vals);
+    int ok = result_ok(r);
+    if (!ok && r != NULL) {
+        log_error("postgres: retry event %s: %s", id, PQresultErrorMessage(r));
+    }
+    PQclear(r);
+    return ok ? 0 : -1;
+}
+
+int db_process_delivery(db_pool *p, const char *event_id, const char *user_id,
+                        int64_t bonus_points)
+{
+    char points[32];
+    snprintf(points, sizeof(points), "%lld", (long long)bonus_points);
+    const char *vals[3] = {event_id, user_id, points};
+    PGresult *r = exec_params(p,
+        "WITH ins AS ("
+        "  INSERT INTO delivery_events (id, user_id, bonus_points)"
+        "  VALUES ($1, $2, $3::bigint)"
+        "  ON CONFLICT (id) DO NOTHING"
+        "  RETURNING user_id, bonus_points"
+        "), upd AS ("
+        "  INSERT INTO user_bonus (user_id, points)"
+        "  SELECT user_id, bonus_points FROM ins"
+        "  ON CONFLICT (user_id) DO UPDATE"
+        "    SET points = user_bonus.points + EXCLUDED.points"
+        "  RETURNING user_id"
+        ")"
+        "SELECT count(*)::text FROM ins", 3, vals);
+    int ok = result_ok(r);
+    if (!ok && r != NULL) {
+        log_error("postgres: delivery %s: %s", event_id,
+                  PQresultErrorMessage(r));
+    }
+    PQclear(r);
+    return ok ? 0 : -1;
+}
+
+int db_get_bonus(db_pool *p, const char *user_id, int64_t *points)
+{
+    const char *vals[1] = {user_id};
+    PGresult *r = exec_params(p,
+        "SELECT COALESCE("
+        "  (SELECT points FROM user_bonus WHERE user_id = $1), 0"
+        ")::text", 1, vals);
+    if (!result_ok(r) || PQntuples(r) != 1) {
+        if (r != NULL) {
+            log_error("postgres: bonus %s: %s", user_id,
+                      PQresultErrorMessage(r));
+        }
+        PQclear(r);
+        return -1;
+    }
+    *points = strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+    PQclear(r);
+    return 0;
 }
 
 void order_free(Order *o)
